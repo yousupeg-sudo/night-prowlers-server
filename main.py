@@ -1,183 +1,144 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-import json
-import os
+import json, os, hashlib
 
 app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 DATA_FILE = "data.json"
 
-# ─── Модели ───────────────────────────────────────────────────────────────────
-
-class CreateBoard(BaseModel):
-    board_name: str
-    admin_password: str
-
-class JoinBoard(BaseModel):
-    board_name: str
-    gd_name: str
-    account_id: int
-
-class JoinWithPoints(BaseModel):
-    board_name: str
-    gd_name: str
-    account_id: int
-    points: float
-
-class AddDemon(BaseModel):
-    board_name: str
-    gd_name: str
-    demon_name: str
-    demon_type: str
-    admin_password: str
-
-class SetPoints(BaseModel):
-    board_name: str
-    gd_name: str
-    points: float
-    admin_password: str
-
-# ─── Хранилище ────────────────────────────────────────────────────────────────
-
-def load_data():
+def load():
     if not os.path.exists(DATA_FILE):
-        return {"boards": {}}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return {"teams": {}}
+    with open(DATA_FILE) as f:
         return json.load(f)
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def save(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
-# ─── Эндпоинты ────────────────────────────────────────────────────────────────
+def hash_pw(pw: str) -> str:
+    return hashlib.sha256(pw.encode()).hexdigest()
 
-@app.get("/")
-def root():
-    return {"status": "Night Prowlers Server is running!"}
+# ── Модели ──────────────────────────────────────────────
 
-@app.post("/board/create")
-def create_board(body: CreateBoard):
-    data = load_data()
-    name = body.board_name.strip().lower()
-    if name in data["boards"]:
-        raise HTTPException(status_code=400, detail="Board already exists")
-    data["boards"][name] = {
-        "display_name": body.board_name.strip(),
-        "admin_password": body.admin_password,
-        "players": []
+class CreateTeam(BaseModel):
+    team_name: str
+    admin_gd_name: str
+    admin_account_id: int
+    admin_points: float
+    is_public: bool = True
+    password: Optional[str] = None
+
+class JoinTeam(BaseModel):
+    team_name: str
+    gd_name: str
+    account_id: int
+    points: float
+    password: Optional[str] = None
+
+class UpdatePoints(BaseModel):
+    team_name: str
+    gd_name: str
+    account_id: int
+    points: float
+
+# ── Эндпоинты ───────────────────────────────────────────
+
+@app.get("/teams")
+def list_teams():
+    """Список всех команд (для браузера)"""
+    data = load()
+    result = []
+    for name, team in data["teams"].items():
+        result.append({
+            "name": name,
+            "is_public": team.get("is_public", True),
+            "member_count": len(team.get("players", [])),
+        })
+    return {"teams": result}
+
+@app.post("/team/create")
+def create_team(body: CreateTeam):
+    data = load()
+    if body.team_name in data["teams"]:
+        raise HTTPException(400, "Team already exists")
+    
+    pw_hash = hash_pw(body.password) if body.password and not body.is_public else None
+
+    data["teams"][body.team_name] = {
+        "is_public": body.is_public,
+        "password_hash": pw_hash,
+        "admin_account_id": body.admin_account_id,
+        "players": [{
+            "gd_name": body.admin_gd_name,
+            "account_id": body.admin_account_id,
+            "points": body.admin_points,
+        }]
     }
-    save_data(data)
-    return {"ok": True, "message": f"Board '{body.board_name}' created!"}
+    save(data)
+    return {"ok": True, "team_name": body.team_name}
 
-@app.post("/board/join")
-def join_board(body: JoinBoard):
-    data = load_data()
-    name = body.board_name.strip().lower()
-    if name not in data["boards"]:
-        raise HTTPException(status_code=404, detail="Board not found")
-    board = data["boards"][name]
-    for p in board["players"]:
+@app.post("/team/join")
+def join_team(body: JoinTeam):
+    data = load()
+    if body.team_name not in data["teams"]:
+        raise HTTPException(404, "Team not found")
+    
+    team = data["teams"][body.team_name]
+    
+    # Проверка пароля для приватных команд
+    if not team.get("is_public", True):
+        if not body.password:
+            raise HTTPException(403, "Password required")
+        if hash_pw(body.password) != team.get("password_hash", ""):
+            raise HTTPException(403, "Wrong password")
+    
+    players = team.get("players", [])
+    
+    # Обновляем если уже есть, иначе добавляем
+    for p in players:
         if p["account_id"] == body.account_id:
-            return {"ok": True, "message": "Already in board"}
-    board["players"].append({
-        "name": body.gd_name,
+            p["gd_name"] = body.gd_name
+            p["points"] = body.points
+            save(data)
+            return {"ok": True, "joined": False, "updated": True}
+    
+    players.append({
+        "gd_name": body.gd_name,
         "account_id": body.account_id,
-        "points": 0.0,
-        "demons": []
+        "points": body.points,
     })
-    save_data(data)
-    return {"ok": True, "message": f"Joined '{board['display_name']}'!"}
+    team["players"] = players
+    save(data)
+    return {"ok": True, "joined": True}
 
-@app.post("/board/join_with_points")
-def join_with_points(body: JoinWithPoints):
-    data = load_data()
-    name = body.board_name.strip().lower()
-    if name not in data["boards"]:
-        raise HTTPException(status_code=404, detail="Board not found")
-    board = data["boards"][name]
-    # Обновляем если уже есть
-    for p in board["players"]:
+@app.post("/team/update_points")
+def update_points(body: UpdatePoints):
+    """Автообновление поинтов без пароля (для тех кто уже в команде)"""
+    data = load()
+    if body.team_name not in data["teams"]:
+        raise HTTPException(404, "Team not found")
+    
+    team = data["teams"][body.team_name]
+    players = team.get("players", [])
+    
+    for p in players:
         if p["account_id"] == body.account_id:
-            p["points"] = round(body.points, 1)
-            p["name"] = body.gd_name
-            save_data(data)
-            return {"ok": True, "message": "Points updated"}
-    # Добавляем нового
-    board["players"].append({
-        "name": body.gd_name,
-        "account_id": body.account_id,
-        "points": round(body.points, 1),
-        "demons": []
-    })
-    save_data(data)
-    return {"ok": True, "message": f"Joined with {body.points} points!"}
-
-@app.get("/board/{board_name}")
-def get_board(board_name: str):
-    data = load_data()
-    name = board_name.strip().lower()
-    if name not in data["boards"]:
-        raise HTTPException(status_code=404, detail="Board not found")
-    board = data["boards"][name]
-    players = sorted(board["players"], key=lambda p: p["points"], reverse=True)
-    return {"board_name": board["display_name"], "players": players}
-
-@app.post("/admin/add_demon")
-def add_demon(body: AddDemon):
-    data = load_data()
-    name = body.board_name.strip().lower()
-    if name not in data["boards"]:
-        raise HTTPException(status_code=404, detail="Board not found")
-    board = data["boards"][name]
-    if board["admin_password"] != body.admin_password:
-        raise HTTPException(status_code=403, detail="Wrong password")
-    for player in board["players"]:
-        if player["name"].lower() == body.gd_name.strip().lower():
-            for d in player["demons"]:
-                if d["name"].lower() == body.demon_name.strip().lower():
-                    raise HTTPException(status_code=400, detail="Demon already added")
-            player["demons"].append({"name": body.demon_name.strip(), "type": body.demon_type.strip().lower()})
-            save_data(data)
+            p["gd_name"] = body.gd_name
+            p["points"] = body.points
+            save(data)
             return {"ok": True}
-    raise HTTPException(status_code=404, detail="Player not found")
+    
+    raise HTTPException(404, "Player not in team")
 
-@app.post("/admin/set_points")
-def set_points(body: SetPoints):
-    data = load_data()
-    name = body.board_name.strip().lower()
-    if name not in data["boards"]:
-        raise HTTPException(status_code=404, detail="Board not found")
-    board = data["boards"][name]
-    if board["admin_password"] != body.admin_password:
-        raise HTTPException(status_code=403, detail="Wrong password")
-    for player in board["players"]:
-        if player["name"].lower() == body.gd_name.strip().lower():
-            player["points"] = round(body.points, 1)
-            save_data(data)
-            return {"ok": True}
-    raise HTTPException(status_code=404, detail="Player not found")
-
-@app.delete("/admin/remove_player")
-def remove_player(board_name: str, gd_name: str, admin_password: str):
-    data = load_data()
-    name = board_name.strip().lower()
-    if name not in data["boards"]:
-        raise HTTPException(status_code=404, detail="Board not found")
-    board = data["boards"][name]
-    if board["admin_password"] != admin_password:
-        raise HTTPException(status_code=403, detail="Wrong password")
-    before = len(board["players"])
-    board["players"] = [p for p in board["players"] if p["name"].lower() != gd_name.strip().lower()]
-    if len(board["players"]) == before:
-        raise HTTPException(status_code=404, detail="Player not found")
-    save_data(data)
-    return {"ok": True}
+@app.get("/team/{team_name}")
+def get_team(team_name: str):
+    data = load()
+    if team_name not in data["teams"]:
+        raise HTTPException(404, "Team not found")
+    team = data["teams"][team_name]
+    return {
+        "name": team_name,
+        "is_public": team.get("is_public", True),
+        "players": sorted(team.get("players", []), key=lambda p: p.get("points", 0), reverse=True)
+    }
